@@ -21,14 +21,14 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "aioitertools",
-    "anthropic",
+    "anthropic==0.76.0",
     "dashscope",
     "docstring_parser",
     "json5",
     "json_repair",
     "mcp>=1.13",
     "numpy",
-    "openai",
+    "openai==2.15.0",
     "python-datauri",
     "opentelemetry-api>=1.39.0",
     "opentelemetry-sdk>=1.39.0",
@@ -40,6 +40,8 @@ dependencies = [
     "sounddevice",
     "sqlalchemy",
     "python-frontmatter",
+    "google-genai==1.56.0",
+    "qdrant-client==1.16.2",
 ]
 
 [project.optional-dependencies]
