@@ -14,6 +14,13 @@ from ._long_term_memory import (
     ReMeTaskLongTermMemory,
     ReMeToolLongTermMemory,
 )
+from ._pruning import (
+    PruningConfig,
+    SoftTrimConfig,
+    HardClearConfig,
+    ToolPruningConfig,
+    ContextPruner,
+)
 
 
 __all__ = [
@@ -28,4 +35,10 @@ __all__ = [
     "ReMePersonalLongTermMemory",
     "ReMeTaskLongTermMemory",
     "ReMeToolLongTermMemory",
+    # Context pruning
+    "PruningConfig",
+    "SoftTrimConfig",
+    "HardClearConfig",
+    "ToolPruningConfig",
+    "ContextPruner",
 ]

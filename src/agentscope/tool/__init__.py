@@ -2,6 +2,11 @@
 """The tool module in agentscope."""
 
 from ._response import ToolResponse
+from ._truncation import (
+    truncate_tool_output,
+    truncate_error_message,
+    DEFAULT_TOOL_OUTPUT_MAX_CHARS,
+)
 from ._coding import (
     execute_python_code,
     execute_shell_command,
@@ -27,6 +32,9 @@ from ._toolkit import Toolkit
 __all__ = [
     "Toolkit",
     "ToolResponse",
+    "truncate_tool_output",
+    "truncate_error_message",
+    "DEFAULT_TOOL_OUTPUT_MAX_CHARS",
     "execute_python_code",
     "execute_shell_command",
     "view_text_file",
