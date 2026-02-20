@@ -559,10 +559,17 @@ class ReActAgent(ReActAgentBase):
                 await self.print(hint_msg)
             await self.memory.add(hint_msg, marks=_MemoryMark.HINT)
 
-        # Get messages from memory
-        memory_msgs = await self.memory.get_memory()
+        # Get messages from memory, excluding already-compressed messages
+        # if compression is enabled (compression marks old turns so they
+        # are replaced by a summary and not re-sent to the model)
+        memory_msgs = await self.memory.get_memory(
+            exclude_mark=_MemoryMark.COMPRESSED
+            if self.compression_config and self.compression_config.enable
+            else None,
+        )
 
-        # Apply context pruning if configured
+        # Apply context pruning if configured (trims large tool result
+        # payloads on a copy without modifying memory)
         pruned_msgs = await self._prune_context_if_needed(memory_msgs)
 
         # Convert Msg objects into the required format of the model API
