@@ -2,9 +2,10 @@
 """The Anthropic token counter class."""
 from typing import Any
 from .._logging import logger
+from ._token_base import TokenCounterBase
 
 
-class AnthropicTokenCounter:
+class AnthropicTokenCounter(TokenCounterBase):
     """The Anthropic token counter class."""
 
     def __init__(self, model_name: str, api_key: str, **kwargs: Any) -> None:

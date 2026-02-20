@@ -53,6 +53,8 @@ a2a = [
     "nacos-sdk-python>=3.0.0",
 ]
 
+# ------------ Realtime -------------
+realtime = ["websockets>=14.0", "scipy"]
 
 # ------------ Model APIs ------------
 gemini = ["google-genai"]
@@ -73,7 +75,7 @@ tokens = [
 redis_memory = ["redis"]
 
 mem0ai = [
-    "mem0ai<=0.1.116",
+    "mem0ai<=1.0.3",
     "packaging"
 ]
 reme = ["reme-ai>=0.2.0.3"]
@@ -96,10 +98,21 @@ docx-reader = [
     "agentscope[text-reader]",
     "python-docx"
 ]
+excel-reader = [
+    "agentscope[text-reader]",
+    "pandas",
+    "openpyxl",
+]
+ppt-reader = [
+    "agentscope[text-reader]",
+    "python-pptx"
+]
 readers = [
     "agentscope[text-reader]",
     "agentscope[pdf-reader]",
     "agentscope[docx-reader]",
+    "agentscope[excel-reader]",
+    "agentscope[ppt-reader]",
 ]
 
 # vdb
@@ -108,12 +121,15 @@ readers = [
 qdrant = ["qdrant-client==1.15.1"]
 milvus = ["pymilvus[milvus_lite]"]
 ali_mysql = ["mysql-connector-python"]
+mongodb = ["pymongo"]
+oceanbase = ["pyobvector>=0.2.0,<0.3.0"]
 vdbs = [
     "agentscope[ali_mysql]",
     "agentscope[qdrant]",
     "agentscope[milvus]",
+    "agentscope[mongodb]",
+    "agentscope[oceanbase]",
 ]
-
 
 rag = [
     "agentscope[readers]",
@@ -131,6 +147,7 @@ full = [
     "agentscope[memory]",
     "agentscope[rag]",
     "agentscope[evaluate]",
+    "agentscope[realtime]",
 ]
 
 # ------------ Development ------------
@@ -150,6 +167,8 @@ dev = [
     "fakeredis",
     "aiosqlite",
     "greenlet",
+    # For openjudge
+    "py-openjudge",
 ]
 
 [project.urls]

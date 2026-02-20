@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # mypy: disable-error-code="dict-item"
 """The Google Gemini model in agentscope."""
+import base64
 import copy
 import warnings
 from datetime import datetime
+import json
 from typing import (
     AsyncGenerator,
     Any,
@@ -353,71 +355,54 @@ class GeminiChatModel(ChatModelBase):
 
         text = ""
         thinking = ""
-        accumulated_tool_calls = []
+        tool_calls: list[ToolUseBlock] = []
         metadata: dict | None = None
-        finish_reason = None
-        final_usage = None
-
         async for chunk in response:
-            # Check finish_reason to detect completion
-            if chunk.candidates and chunk.candidates[0].finish_reason:
-                finish_reason = chunk.candidates[0].finish_reason
-                # Log non-STOP finish reasons to diagnose issues
-                if finish_reason not in ["STOP", "MAX_TOKENS"]:
-                    logger.warning(
-                        f"Gemini stream ended with finish_reason: {finish_reason}. "
-                        f"This may indicate an error or unexpected termination."
-                    )
-
-            # Process parts manually to avoid warnings when mixing text and function_calls
             if (
                 chunk.candidates
                 and chunk.candidates[0].content
                 and chunk.candidates[0].content.parts
             ):
                 for part in chunk.candidates[0].content.parts:
-                    # Thinking parts
-                    if part.thought and part.text:
-                        thinking += part.text
-                    # Text parts (extract manually to avoid .text property warning)
-                    elif hasattr(part, 'text') and part.text and not part.thought:
-                        text += part.text
-                        if structured_model:
-                            metadata = _json_loads_with_repair(text)
-                    # Function call parts - accumulate all tool calls
-                    elif hasattr(part, 'function_call') and part.function_call:
-                        # Check if this tool call already exists (avoid duplicates)
-                        tool_call_exists = any(
-                            tc["id"] == part.function_call.id
-                            for tc in accumulated_tool_calls
-                        )
-                        if not tool_call_exists:
-                            accumulated_tool_calls.append(
-                                ToolUseBlock(
-                                    type="tool_use",
-                                    id=part.function_call.id,
-                                    name=part.function_call.name,
-                                    input=part.function_call.args or {},
-                                ),
-                            )
+                    if part.text:
+                        if part.thought:
+                            thinking += part.text
+                        else:
+                            text += part.text
 
-            # Legacy function_calls accessor (keeping for compatibility)
-            if chunk.function_calls:
-                for function_call in chunk.function_calls:
-                    # Check if this tool call already exists
-                    tool_call_exists = any(
-                        tc["id"] == function_call.id
-                        for tc in accumulated_tool_calls
-                    )
-                    if not tool_call_exists:
-                        accumulated_tool_calls.append(
+                    if part.function_call:
+                        keyword_args = part.function_call.args or {}
+                        # .. note:: Gemini API always returns None for
+                        # function_call.id, so we use thought_signature
+                        # as the unique identifier for tool
+                        # calls when available. That maybe
+                        # infeasible someday, but Gemini
+                        # requires the thought_signature for some
+                        # llms like gemini-3-pro
+
+                        if part.thought_signature:
+                            call_id = base64.b64encode(
+                                part.thought_signature,
+                            ).decode("utf-8")
+                        else:
+                            call_id = part.function_call.id
+
+                        tool_calls.append(
                             ToolUseBlock(
                                 type="tool_use",
-                                id=function_call.id,
-                                name=function_call.name,
-                                input=function_call.args or {},
+                                id=call_id,
+                                name=part.function_call.name,
+                                input=keyword_args,
+                                raw_input=json.dumps(
+                                    keyword_args,
+                                    ensure_ascii=False,
+                                ),
                             ),
                         )
+
+            # Text parts
+            if text and structured_model:
+                metadata = _json_loads_with_repair(text)
 
             # Track the latest usage metadata
             if chunk.usage_metadata:
@@ -428,84 +413,30 @@ class GeminiChatModel(ChatModelBase):
                     time=(datetime.now() - start_datetime).total_seconds(),
                 )
 
-            # Only yield when we have finish_reason (complete response)
-            if finish_reason:
-                content_block: list = []
+            # The content blocks for the current chunk
+            content_blocks: list = []
 
-                if thinking:
-                    content_block.append(
-                        ThinkingBlock(
-                            type="thinking",
-                            thinking=thinking,
-                        ),
-                    )
-
-                if text:
-                    content_block.append(
-                        TextBlock(
-                            type="text",
-                            text=text,
-                        ),
-                    )
-
-                content_block.extend(accumulated_tool_calls)
-
-                # Yield the final complete response
-                if content_block:
-                    yield ChatResponse(
-                        content=content_block,
-                        usage=final_usage,
-                        metadata=metadata,
-                    )
-                else:
-                    # Handle case where finish_reason is present but no content
-                    error_messages = {
-                        "UNEXPECTED_TOOL_CALL": "The model attempted to use a tool unexpectedly. This may indicate a configuration issue with tool definitions or the model's understanding of when to use tools.",
-                        "SAFETY": "The response was blocked due to safety filters.",
-                        "RECITATION": "The response was blocked due to recitation concerns.",
-                        "OTHER": "The response ended unexpectedly.",
-                    }
-                    error_msg = error_messages.get(
-                        finish_reason,
-                        f"Response ended with reason: {finish_reason}"
-                    )
-                    logger.warning(
-                        f"Stream ended with finish_reason '{finish_reason}' but no content. "
-                        f"Returning error message."
-                    )
-                    yield ChatResponse(
-                        content=[
-                            TextBlock(
-                                type="text",
-                                text=f"Error: {error_msg}",
-                            )
-                        ],
-                        usage=final_usage,
-                        metadata=metadata,
-                    )
-                break  # Exit after yielding final response
-
-        # Check if we exited without finish_reason
-        if not finish_reason:
-            logger.warning(
-                "Gemini stream ended without finish_reason. "
-                "Yielding accumulated content anyway."
-            )
-            # Yield what we have accumulated
-            content_block: list = []
             if thinking:
-                content_block.append(ThinkingBlock(
-                    type="thinking", thinking=thinking))
-            if text:
-                content_block.append(TextBlock(type="text", text=text))
-            content_block.extend(accumulated_tool_calls)
-
-            if content_block:
-                yield ChatResponse(
-                    content=content_block,
-                    usage=final_usage,
-                    metadata=metadata,
+                content_blocks.append(
+                    ThinkingBlock(
+                        type="thinking",
+                        thinking=thinking,
+                    ),
                 )
+
+            if text:
+                content_blocks.append(
+                    TextBlock(
+                        type="text",
+                        text=text,
+                    ),
+                )
+
+            yield ChatResponse(
+                content=content_blocks + tool_calls,
+                usage=final_usage,
+                metadata=metadata,
+            )
 
     def _parse_gemini_generation_response(
         self,
@@ -535,6 +466,7 @@ class GeminiChatModel(ChatModelBase):
         """
         content_blocks: List[TextBlock | ToolUseBlock | ThinkingBlock] = []
         metadata: dict | None = None
+        tool_calls: list = []
 
         if (
             response.candidates
@@ -542,34 +474,54 @@ class GeminiChatModel(ChatModelBase):
             and response.candidates[0].content.parts
         ):
             for part in response.candidates[0].content.parts:
-                if part.thought and part.text:
-                    content_blocks.append(
-                        ThinkingBlock(
-                            type="thinking",
-                            thinking=part.text,
+                if part.text:
+                    if part.thought:
+                        content_blocks.append(
+                            ThinkingBlock(
+                                type="thinking",
+                                thinking=part.text,
+                            ),
+                        )
+                    else:
+                        content_blocks.append(
+                            TextBlock(
+                                type="text",
+                                text=part.text,
+                            ),
+                        )
+
+                if part.function_call:
+                    keyword_args = part.function_call.args or {}
+                    # .. note:: Gemini API always returns None for
+                    # function_call.id, so we use thought_signature
+                    # as the unique identifier for tool
+                    # calls when available. That maybe infeasible
+                    # someday, but Gemini requires the thought_signature
+                    # for some llms like gemini-3-pro
+
+                    if part.thought_signature:
+                        call_id = base64.b64encode(
+                            part.thought_signature,
+                        ).decode("utf-8")
+                    else:
+                        call_id = part.function_call.id
+
+                    tool_calls.append(
+                        ToolUseBlock(
+                            type="tool_use",
+                            id=call_id,
+                            name=part.function_call.name,
+                            input=keyword_args,
+                            raw_input=json.dumps(
+                                keyword_args,
+                                ensure_ascii=False,
+                            ),
                         ),
                     )
 
-        if response.text:
-            content_blocks.append(
-                TextBlock(
-                    type="text",
-                    text=response.text,
-                ),
-            )
-            if structured_model:
-                metadata = _json_loads_with_repair(response.text)
-
-        if response.function_calls:
-            for tool_call in response.function_calls:
-                content_blocks.append(
-                    ToolUseBlock(
-                        type="tool_use",
-                        id=tool_call.id,
-                        name=tool_call.name,
-                        input=tool_call.args or {},
-                    ),
-                )
+        # For the structured output case
+        if response.text and structured_model:
+            metadata = _json_loads_with_repair(response.text)
 
         if response.usage_metadata:
             usage = ChatUsage(
@@ -583,7 +535,7 @@ class GeminiChatModel(ChatModelBase):
             usage = None
 
         return ChatResponse(
-            content=content_blocks,
+            content=content_blocks + tool_calls,
             usage=usage,
             metadata=metadata,
         )
