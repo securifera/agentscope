@@ -11,11 +11,15 @@ from ._reader import (
     PDFReader,
     ImageReader,
     WordReader,
+    ExcelReader,
+    PowerPointReader,
 )
 from ._store import (
     VDBStoreBase,
     QdrantStore,
     MilvusLiteStore,
+    OceanBaseStore,
+    MongoDBStore,
     AlibabaCloudMySQLStore,
 )
 from ._knowledge_base import KnowledgeBase
@@ -28,11 +32,15 @@ __all__ = [
     "PDFReader",
     "ImageReader",
     "WordReader",
+    "ExcelReader",
+    "PowerPointReader",
     "DocMetadata",
     "Document",
     "VDBStoreBase",
     "QdrantStore",
     "MilvusLiteStore",
+    "OceanBaseStore",
+    "MongoDBStore",
     "AlibabaCloudMySQLStore",
     "KnowledgeBase",
     "SimpleKnowledge",

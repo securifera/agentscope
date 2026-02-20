@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """The dashscope API model classes."""
+import copy
 import collections
+import json
+import os
 import warnings
 from datetime import datetime
 from http import HTTPStatus
@@ -46,7 +49,25 @@ else:
 
 class DashScopeChatModel(ChatModelBase):
     """The DashScope chat model class, which unifies the Generation and
-    MultimodalConversation APIs into one method."""
+    MultimodalConversation APIs into one method.
+
+    This class provides a unified interface for DashScope API by automatically
+    selecting between text-only (Generation API) and multimodal
+    (MultiModalConversation API) endpoints. The `multimodality` parameter
+    allows explicit control over API selection:
+
+    - When `multimodality=True`: Forces use of MultiModalConversation API
+      for handling images, videos, and other multimodal inputs
+    - When `multimodality=False`: Forces use of Generation API for
+      text-only processing
+    - When `multimodality=None` (default): Automatically selects the API
+      based on model name (e.g., models with "-vl" suffix or starting
+      with "qvq" will use MultiModalConversation API)
+
+    This design enables seamless switching between text and multimodal
+    models without changing code structure, making it easier to work with
+    DashScope's diverse model offerings.
+    """
 
     def __init__(
         self,
@@ -54,8 +75,10 @@ class DashScopeChatModel(ChatModelBase):
         api_key: str,
         stream: bool = True,
         enable_thinking: bool | None = None,
+        multimodality: bool | None = None,
         generate_kwargs: dict[str, JSONSerializableObject] | None = None,
         base_http_api_url: str | None = None,
+        stream_tool_parsing: bool = True,
         **_kwargs: Any,
     ) -> None:
         """Initialize the DashScope chat model.
@@ -72,6 +95,14 @@ class DashScopeChatModel(ChatModelBase):
                 Refer to `DashScope documentation
                 <https://help.aliyun.com/zh/model-studio/deep-thinking>`_
                 for more details.
+            multimodality (`bool | None`, optional):
+                Whether to use multimodal conversation API. If `True`,
+                it will use `dashscope.MultiModalConversation.call`
+                to process multimodal inputs such as images and text. If
+                `False`, it will use
+                `dashscope.aigc.generation.AioGeneration.call` to process
+                text inputs. If `None` (default), the choice is based on
+                the model name.
             generate_kwargs (`dict[str, JSONSerializableObject] | None`, \
             optional):
                The extra keyword arguments used in DashScope API generation,
@@ -79,6 +110,12 @@ class DashScopeChatModel(ChatModelBase):
             base_http_api_url (`str | None`, optional):
                 The base URL for DashScope API requests. If not provided,
                 the default base URL from the DashScope SDK will be used.
+            stream_tool_parsing (`bool`, default to `True`):
+                Whether to parse incomplete tool use JSON in streaming mode
+                with auto-repair. If True, partial JSON (e.g., `'{"a": "x'`)
+                is repaired to valid dicts (`{"a": "x"}`) in real-time for
+                immediate tool function input. Otherwise, the input field
+                remains {} until the final chunk arrives.
             **_kwargs (`Any`):
                 Additional keyword arguments.
         """
@@ -93,12 +130,33 @@ class DashScopeChatModel(ChatModelBase):
 
         self.api_key = api_key
         self.enable_thinking = enable_thinking
+        self.multimodality = multimodality
         self.generate_kwargs = generate_kwargs or {}
+        self.stream_tool_parsing = stream_tool_parsing
 
         if base_http_api_url is not None:
             import dashscope
 
             dashscope.base_http_api_url = base_http_api_url
+
+        # Load headers from environment variable if exists
+        headers = os.getenv("DASHSCOPE_API_HEADERS")
+        if headers:
+            try:
+                headers = json.loads(str(headers))
+                if not isinstance(headers, dict):
+                    raise json.JSONDecodeError("", "", 0)
+
+                if self.generate_kwargs.get("headers"):
+                    headers.update(self.generate_kwargs["headers"])
+
+                self.generate_kwargs["headers"] = headers
+
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Failed to parse DASHSCOPE_API_HEADERS environment "
+                    "variable as JSON. It should be a JSON object.",
+                )
 
     @trace_llm
     async def __call__(
@@ -152,15 +210,6 @@ class DashScopeChatModel(ChatModelBase):
         """
         import dashscope
 
-        # For qvq and qwen-vl models, the content field cannot be `None` or
-        # `[{"text": None}]`, so we need to convert it to an empty list.
-        if self.model_name.startswith("qvq") or "-vl" in self.model_name:
-            for msg in messages:
-                if msg["content"] is None or msg["content"] == [
-                    {"text": None},
-                ]:
-                    msg["content"] = []
-
         kwargs = {
             "messages": messages,
             "model": self.model_name,
@@ -212,7 +261,15 @@ class DashScopeChatModel(ChatModelBase):
             )
 
         start_datetime = datetime.now()
-        if self.model_name.startswith("qvq") or "-vl" in self.model_name:
+        if self.multimodality or (
+            self.multimodality is None
+            and (
+                self.model_name.startswith(
+                    "qvq",
+                )
+                or "-vl" in self.model_name
+            )
+        ):
             response = dashscope.MultiModalConversation.call(
                 api_key=self.api_key,
                 **kwargs,
@@ -239,7 +296,7 @@ class DashScopeChatModel(ChatModelBase):
 
         return parsed_response
 
-    # pylint: disable=too-many-branches
+    # pylint: disable=too-many-branches, too-many-statements
     async def _parse_dashscope_stream_response(
         self,
         start_datetime: datetime,
@@ -277,7 +334,10 @@ class DashScopeChatModel(ChatModelBase):
         """
         acc_content, acc_thinking_content = "", ""
         acc_tool_calls = collections.defaultdict(dict)
+        last_input_objs = {}  # Store last input_obj for each tool_call
         metadata = None
+        last_content = None
+        usage = None
 
         async for chunk in giter(response):
             if chunk.status_code != HTTPStatus.OK:
@@ -324,8 +384,9 @@ class DashScopeChatModel(ChatModelBase):
                             + func["arguments"]
                         )
 
-            # to content blocks
+            # Build content blocks (always include thinking and text)
             content_blocks: list[TextBlock | ToolUseBlock | ThinkingBlock] = []
+
             if acc_thinking_content:
                 content_blocks.append(
                     ThinkingBlock(
@@ -343,39 +404,78 @@ class DashScopeChatModel(ChatModelBase):
                 )
 
             for tool_call in acc_tool_calls.values():
-                repaired_input = _json_loads_with_repair(
-                    tool_call.get("arguments", "{}") or "{}",
-                )
+                # Only add intermediate tool use blocks if
+                # stream_tool_parsing is True
+                tool_id = tool_call.get("id", "")
+                input_str = tool_call.get("arguments")
 
-                if not isinstance(repaired_input, dict):
+                # If parsing the tool input in streaming mode
+                if self.stream_tool_parsing:
+                    repaired_input = _json_loads_with_repair(
+                        input_str or "{}",
+                    )
+                    # If the new repaired input is shorter than one in the last
+                    # chunk, use the last one to avoid regression
+                    last_input = last_input_objs.get(tool_id, {})
+                    if len(json.dumps(last_input)) > len(
+                        json.dumps(repaired_input),
+                    ):
+                        repaired_input = last_input
+                    last_input_objs[tool_id] = repaired_input
+
+                else:
+                    # Otherwise, keep input as empty dict until the final chunk
                     repaired_input = {}
 
                 content_blocks.append(
                     ToolUseBlock(
                         type="tool_use",
-                        id=tool_call.get("id", ""),
+                        id=tool_id,
                         name=tool_call.get("name", ""),
                         input=repaired_input,
+                        raw_input=input_str,
                     ),
                 )
 
                 if structured_model:
                     metadata = repaired_input
 
-            usage = None
             if chunk.usage:
                 usage = ChatUsage(
                     input_tokens=chunk.usage.input_tokens,
                     output_tokens=chunk.usage.output_tokens,
                     time=(datetime.now() - start_datetime).total_seconds(),
+                    metadata=chunk.usage,
                 )
 
-            parsed_chunk = ChatResponse(
-                content=content_blocks,
+            if content_blocks:
+                parsed_chunk = ChatResponse(
+                    content=content_blocks,
+                    usage=usage,
+                    metadata=metadata,
+                )
+                yield parsed_chunk
+                last_content = copy.deepcopy(content_blocks)
+
+        # If stream_tool_parsing is False, we need to parse the final tool
+        # use inputs here
+        if not self.stream_tool_parsing and last_content and acc_tool_calls:
+            metadata = None
+            # Update tool use blocks in last_contents inplace
+            for block in last_content:
+                if block.get("type") == "tool_use":
+                    block["input"] = input_obj = _json_loads_with_repair(
+                        str(block.get("raw_input") or "{}"),
+                    )
+
+                    if structured_model:
+                        metadata = input_obj
+
+            yield ChatResponse(
+                content=last_content,
                 usage=usage,
                 metadata=metadata,
             )
-            yield parsed_chunk
 
     async def _parse_dashscope_generation_response(
         self,
@@ -469,6 +569,7 @@ class DashScopeChatModel(ChatModelBase):
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
                 time=(datetime.now() - start_datetime).total_seconds(),
+                metadata=response.usage,
             )
 
         parsed_response = ChatResponse(
