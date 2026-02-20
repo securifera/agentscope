@@ -1117,6 +1117,25 @@ class ReActAgent(ReActAgentBase):
                     ),
                 )
 
+                # Mark the compressed messages in the memory storage
+                await self.memory.update_messages_mark(
+                    msg_ids=[_.id for _ in to_compressed_msgs],
+                    new_mark=_MemoryMark.COMPRESSED,
+                )
+
+                logger.info(
+                    "Finished compressing %d messages in agent %s.",
+                    len(to_compressed_msgs),
+                    self.name,
+                )
+
+            else:
+                logger.warning(
+                    "Failed to obtain compression summary from the model "
+                    "structured output in agent %s.",
+                    self.name,
+                )
+
     async def _prune_context_if_needed(
         self,
         messages: list[Msg],
@@ -1153,22 +1172,3 @@ class ReActAgent(ReActAgentBase):
         )
 
         return pruned_messages
-
-                # Mark the compressed messages in the memory storage
-                await self.memory.update_messages_mark(
-                    msg_ids=[_.id for _ in to_compressed_msgs],
-                    new_mark=_MemoryMark.COMPRESSED,
-                )
-
-                logger.info(
-                    "Finished compressing %d messages in agent %s.",
-                    len(to_compressed_msgs),
-                    self.name,
-                )
-
-            else:
-                logger.warning(
-                    "Failed to obtain compression summary from the model "
-                    "structured output in agent %s.",
-                    self.name,
-                )

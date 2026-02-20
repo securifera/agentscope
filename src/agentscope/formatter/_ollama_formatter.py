@@ -230,7 +230,12 @@ class OllamaChatFormatter(TruncatedFormatterBase):
                             block,  # type: ignore[arg-type]
                         ),
                     )
-
+                elif typ == "thinking":
+                    thinking_text = block.get("thinking")
+                    logger.debug(
+                        "Thinking block: %s",
+                        thinking_text,
+                    )
                 else:
                     logger.warning(
                         "Unsupported block type %s in the message, skipped.",

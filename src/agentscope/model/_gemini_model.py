@@ -353,72 +353,159 @@ class GeminiChatModel(ChatModelBase):
 
         text = ""
         thinking = ""
+        accumulated_tool_calls = []
         metadata: dict | None = None
-        async for chunk in response:
-            content_block: list = []
+        finish_reason = None
+        final_usage = None
 
-            # Thinking parts
+        async for chunk in response:
+            # Check finish_reason to detect completion
+            if chunk.candidates and chunk.candidates[0].finish_reason:
+                finish_reason = chunk.candidates[0].finish_reason
+                # Log non-STOP finish reasons to diagnose issues
+                if finish_reason not in ["STOP", "MAX_TOKENS"]:
+                    logger.warning(
+                        f"Gemini stream ended with finish_reason: {finish_reason}. "
+                        f"This may indicate an error or unexpected termination."
+                    )
+
+            # Process parts manually to avoid warnings when mixing text and function_calls
             if (
                 chunk.candidates
                 and chunk.candidates[0].content
                 and chunk.candidates[0].content.parts
             ):
                 for part in chunk.candidates[0].content.parts:
+                    # Thinking parts
                     if part.thought and part.text:
                         thinking += part.text
+                    # Text parts (extract manually to avoid .text property warning)
+                    elif hasattr(part, 'text') and part.text and not part.thought:
+                        text += part.text
+                        if structured_model:
+                            metadata = _json_loads_with_repair(text)
+                    # Function call parts - accumulate all tool calls
+                    elif hasattr(part, 'function_call') and part.function_call:
+                        # Check if this tool call already exists (avoid duplicates)
+                        tool_call_exists = any(
+                            tc["id"] == part.function_call.id
+                            for tc in accumulated_tool_calls
+                        )
+                        if not tool_call_exists:
+                            accumulated_tool_calls.append(
+                                ToolUseBlock(
+                                    type="tool_use",
+                                    id=part.function_call.id,
+                                    name=part.function_call.name,
+                                    input=part.function_call.args or {},
+                                ),
+                            )
 
-            # Text parts
-            if chunk.text:
-                text += chunk.text
-                if structured_model:
-                    metadata = _json_loads_with_repair(text)
-
-            # Function calls
-            tool_calls = []
+            # Legacy function_calls accessor (keeping for compatibility)
             if chunk.function_calls:
                 for function_call in chunk.function_calls:
-                    tool_calls.append(
-                        ToolUseBlock(
-                            type="tool_use",
-                            id=function_call.id,
-                            name=function_call.name,
-                            input=function_call.args or {},
-                        ),
+                    # Check if this tool call already exists
+                    tool_call_exists = any(
+                        tc["id"] == function_call.id
+                        for tc in accumulated_tool_calls
                     )
+                    if not tool_call_exists:
+                        accumulated_tool_calls.append(
+                            ToolUseBlock(
+                                type="tool_use",
+                                id=function_call.id,
+                                name=function_call.name,
+                                input=function_call.args or {},
+                            ),
+                        )
 
-            usage = None
+            # Track the latest usage metadata
             if chunk.usage_metadata:
-                usage = ChatUsage(
+                final_usage = ChatUsage(
                     input_tokens=chunk.usage_metadata.prompt_token_count,
                     output_tokens=chunk.usage_metadata.total_token_count
                     - chunk.usage_metadata.prompt_token_count,
                     time=(datetime.now() - start_datetime).total_seconds(),
                 )
 
-            if thinking:
-                content_block.append(
-                    ThinkingBlock(
-                        type="thinking",
-                        thinking=thinking,
-                    ),
-                )
+            # Only yield when we have finish_reason (complete response)
+            if finish_reason:
+                content_block: list = []
 
-            if text:
-                content_block.append(
-                    TextBlock(
-                        type="text",
-                        text=text,
-                    ),
-                )
+                if thinking:
+                    content_block.append(
+                        ThinkingBlock(
+                            type="thinking",
+                            thinking=thinking,
+                        ),
+                    )
 
-            content_block.extend(tool_calls)
+                if text:
+                    content_block.append(
+                        TextBlock(
+                            type="text",
+                            text=text,
+                        ),
+                    )
 
-            parsed_chunk = ChatResponse(
-                content=content_block,
-                usage=usage,
-                metadata=metadata,
+                content_block.extend(accumulated_tool_calls)
+
+                # Yield the final complete response
+                if content_block:
+                    yield ChatResponse(
+                        content=content_block,
+                        usage=final_usage,
+                        metadata=metadata,
+                    )
+                else:
+                    # Handle case where finish_reason is present but no content
+                    error_messages = {
+                        "UNEXPECTED_TOOL_CALL": "The model attempted to use a tool unexpectedly. This may indicate a configuration issue with tool definitions or the model's understanding of when to use tools.",
+                        "SAFETY": "The response was blocked due to safety filters.",
+                        "RECITATION": "The response was blocked due to recitation concerns.",
+                        "OTHER": "The response ended unexpectedly.",
+                    }
+                    error_msg = error_messages.get(
+                        finish_reason,
+                        f"Response ended with reason: {finish_reason}"
+                    )
+                    logger.warning(
+                        f"Stream ended with finish_reason '{finish_reason}' but no content. "
+                        f"Returning error message."
+                    )
+                    yield ChatResponse(
+                        content=[
+                            TextBlock(
+                                type="text",
+                                text=f"Error: {error_msg}",
+                            )
+                        ],
+                        usage=final_usage,
+                        metadata=metadata,
+                    )
+                break  # Exit after yielding final response
+
+        # Check if we exited without finish_reason
+        if not finish_reason:
+            logger.warning(
+                "Gemini stream ended without finish_reason. "
+                "Yielding accumulated content anyway."
             )
-            yield parsed_chunk
+            # Yield what we have accumulated
+            content_block: list = []
+            if thinking:
+                content_block.append(ThinkingBlock(
+                    type="thinking", thinking=thinking))
+            if text:
+                content_block.append(TextBlock(type="text", text=text))
+            content_block.extend(accumulated_tool_calls)
+
+            if content_block:
+                yield ChatResponse(
+                    content=content_block,
+                    usage=final_usage,
+                    metadata=metadata,
+                )
 
     def _parse_gemini_generation_response(
         self,

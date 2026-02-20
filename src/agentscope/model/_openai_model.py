@@ -13,7 +13,7 @@ from typing import (
 )
 from collections import OrderedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 from . import ChatResponse
 from ._model_base import ChatModelBase
@@ -36,6 +36,68 @@ if TYPE_CHECKING:
 else:
     ChatCompletion = "openai.types.chat.ChatCompletion"
     AsyncStream = "openai.types.chat.AsyncStream"
+
+from openai import pydantic_function_tool
+
+
+def _pydantic_model_from_schema(name: str, schema: dict) -> type[BaseModel]:
+    fields = {}
+    required = set(schema.get("required", []))
+
+    for field, spec in schema.get("properties", {}).items():
+        py_type = {
+            "string": str,
+            "integer": int,
+            "number": float,
+            "boolean": bool,
+            "array": list,
+            "object": dict,
+        }.get(spec.get("type"), Any)
+
+        default = ... if field in required else spec.get("default", None)
+        fields[field] = (py_type, default)
+
+    return create_model(name, **fields)
+
+
+def _convert_tools_for_responses_api(client, tools: list[dict], cache: dict | None = None) -> list[Any]:
+    converted = []
+    cache = cache or {}
+
+    for t in tools:
+        # Leave non-function tools alone (e.g. web_search)
+        if t.get("type") != "function":
+            converted.append(t)
+            continue
+
+        fn = t.get("function", t)
+
+        # Already a Pydantic tool → keep
+        if not isinstance(fn, dict):
+            converted.append(t)
+            continue
+
+        # Check cache first
+        fn_name = fn["name"]
+        if fn_name in cache:
+            converted.append(cache[fn_name])
+            continue
+
+        # Create and cache the Pydantic tool
+        model = _pydantic_model_from_schema(
+            f"{fn_name.title()}Args",
+            fn["parameters"],
+        )
+
+        pydantic_tool = pydantic_function_tool(
+            model,
+            name=fn_name,
+            description=fn.get("description", ""),
+        )
+        cache[fn_name] = pydantic_tool
+        converted.append(pydantic_tool)
+
+    return converted
 
 
 def _format_audio_data_for_qwen_omni(messages: list[dict]) -> None:
@@ -164,6 +226,8 @@ class OpenAIChatModel(ChatModelBase):
         self.reasoning_effort = reasoning_effort
         self.generate_kwargs = generate_kwargs or {}
         self.enable_web_search = enable_web_search
+        self._pydantic_tools_cache: dict[str,
+                                         Any] = {}  # Cache converted tools
 
     @trace_llm
     async def __call__(
@@ -231,9 +295,16 @@ class OpenAIChatModel(ChatModelBase):
         if "omni" in self.model_name.lower():
             _format_audio_data_for_qwen_omni(messages)
 
-        # Decide whether to use Responses API (needed for native web_search)
+        # Decide whether to use Responses API (only when web_search tool is explicitly requested)
+        has_web_search_tool = (
+            tools and any(
+                (isinstance(t, dict) and t.get("type") == "web_search")
+                for t in tools
+            )
+        )
         use_responses_api = (
             self.enable_web_search
+            and has_web_search_tool
             and not structured_model
             and hasattr(self.client, "responses")
         )
@@ -248,30 +319,57 @@ class OpenAIChatModel(ChatModelBase):
                 # - Output: 'output_text', 'refusal', etc.
                 responses_input = []
                 for m in messages:
-                    role = m.get("role", "user")
+                    # Normalize role to Responses API supported values
+                    raw_role = m.get("role", "user")
+                    if raw_role is None:
+                        raw_role = "user"
+                    role = str(raw_role).lower()
+                    if role not in ("assistant", "system", "developer", "user"):
+                        # Map common legacy/custom roles to a supported role
+                        if role in ("tool", "function", "tool_use", "tool-use", "agent"):
+                            role = "assistant"
+                        else:
+                            role = "user"
 
                     if isinstance(m.get("content"), list):
                         # Content is structured blocks - need to convert types
                         content_items = []
                         for block in m["content"]:
                             block_copy = {**block}
-                            # Convert 'text' to 'input_text' or 'output_text' based on role
+                            # Convert legacy 'text' blocks to Responses API types
                             if block.get("type") == "text":
                                 if role == "assistant":
                                     block_copy["type"] = "output_text"
                                 else:
                                     block_copy["type"] = "input_text"
+                                # Ensure 'text' is never None (Responses requires string)
+                                if block_copy.get("text") is None:
+                                    block_copy["text"] = ""
                             elif block.get("type") == "image_url":
                                 block_copy["type"] = "input_image"
                                 # Responses API expects 'source' not 'image_url'
                                 if "image_url" in block_copy:
                                     block_copy["source"] = block_copy.pop(
                                         "image_url")
+                            else:
+                                # Defensive: make sure text fields are strings
+                                if "text" in block_copy and block_copy["text"] is None:
+                                    block_copy["text"] = ""
                             content_items.append(block_copy)
                     else:
-                        # Simple string content - wrap in input_text block
+                        # Simple string content - wrap in input_text or
+                        # output_text block depending on the role. Coerce
+                        # None -> empty string and non-string -> str().
+                        content_type = "output_text" if role == "assistant" else "input_text"
+                        raw = m.get("content")
+                        if raw is None:
+                            content_text = ""
+                        elif isinstance(raw, str):
+                            content_text = raw
+                        else:
+                            content_text = str(raw)
                         content_items = [
-                            {"type": "input_text", "text": m["content"]}]
+                            {"type": content_type, "text": content_text}]
 
                     responses_input.append(
                         {
@@ -280,12 +378,23 @@ class OpenAIChatModel(ChatModelBase):
                         },
                     )
 
-                tools_to_send: list[dict] = []
+                tools_to_send: list[Any] = []
                 if tools:
                     tools_to_send.extend(tools)
-                # Native web_search tool
-                if not any(t.get("type") == "web_search" for t in tools_to_send):
-                    tools_to_send.append({"type": "web_search"})
+
+                # Add web_search tool if enabled and not already present
+                if self.enable_web_search:
+                    if not any(
+                        (isinstance(t, dict) and t.get("type") == "web_search")
+                        for t in tools_to_send
+                    ):
+                        tools_to_send.append({"type": "web_search"})
+
+                # Convert legacy function tools → Pydantic tools (with caching)
+                tools_to_send = _convert_tools_for_responses_api(
+                    self.client,
+                    tools_to_send,
+                    cache=self._pydantic_tools_cache,)
 
                 resp_kwargs = {
                     "model": self.model_name,
@@ -709,6 +818,7 @@ class OpenAIChatModel(ChatModelBase):
         usage = None
         async with response as stream:
             async for event in stream:
+                # logger.debug("Responses stream event: %s", str(event))
                 et = getattr(event, "type", None)
                 if et == "response.error":
                     logger.error("Responses stream error: %s",
@@ -739,20 +849,39 @@ class OpenAIChatModel(ChatModelBase):
                     text += event.delta
                 if et == "response.output_audio.delta":
                     audio += event.delta
-                if et == "response.output_tool_calls.delta":
-                    for tc in event.delta:
-                        idx = tc.get("index")
-                        fn = tc.get("function", {})
-                        if idx in tool_calls:
-                            if fn.get("arguments"):
-                                tool_calls[idx]["input"] += fn["arguments"]
-                        else:
-                            tool_calls[idx] = {
-                                "type": "tool_use",
-                                "id": tc.get("id"),
-                                "name": fn.get("name"),
-                                "input": fn.get("arguments", ""),
-                            }
+                if et == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "function_call":
+                        tool_calls[item.id] = {
+                            "type": "tool_use",
+                            "id": item.call_id,
+                            "name": item.name,
+                            "input": "",
+                        }
+
+                if et == "response.function_call_arguments.delta":
+                    tc = tool_calls.get(event.item_id)
+                    if tc:
+                        tc["input"] += event.delta
+
+                # if et == "response.output_tool_calls.delta":
+                #     for tc in event.delta:
+                #         idx = tc.get("index")
+                #         fn = tc.get("function", {})
+                #         args = fn.get("arguments")
+                #         if idx not in tool_calls:
+                #             tool_calls[idx] = {
+                #                 "type": "tool_use",
+                #                 "id": tc.get("id"),
+                #                 "name": fn.get("name"),
+                #                 "input": args if isinstance(args, dict) else "",
+                #             }
+                #         else:
+                #             if isinstance(args, str):
+                #                 tool_calls[idx]["input"] += args
+                #             elif isinstance(args, dict):
+                #                 tool_calls[idx]["input"] = args
+
                 if et and et.startswith("response."):
                     contents: list[Any] = []
                     if audio:
@@ -774,8 +903,11 @@ class OpenAIChatModel(ChatModelBase):
                                 type="tool_use",
                                 id=tc["id"],
                                 name=tc["name"],
-                                input=_json_loads_with_repair(
-                                    tc["input"] or "{}"),
+                                input=(
+                                    tc["input"]
+                                    if isinstance(tc["input"], dict)
+                                    else _json_loads_with_repair(tc["input"] or "{}")
+                                ),
                             ),
                         )
                     if not contents:
@@ -806,18 +938,31 @@ class OpenAIChatModel(ChatModelBase):
                             ),
                         ),
                     )
-                if item.type == "output_tool_calls":
-                    for tc in item.tool_calls:
-                        fn = tc.get("function", {})
-                        contents.append(
-                            ToolUseBlock(
-                                type="tool_use",
-                                id=tc.get("id"),
-                                name=fn.get("name"),
-                                input=_json_loads_with_repair(
-                                    fn.get("arguments", "{}")),
-                            ),
+                # if item.type == "output_tool_calls":
+                #     for tc in item.tool_calls:
+                #         fn = tc.get("function", {})
+                #         args = fn.get("arguments", {})
+                #         contents.append(
+                #             ToolUseBlock(
+                #                 type="tool_use",
+                #                 id=tc.get("id"),
+                #                 name=fn.get("name"),
+                #                 input=args if isinstance(args, dict)
+                #                 else _json_loads_with_repair(args),
+                #             ),
+                #         )
+                if item.type == "function_call":
+                    contents.append(
+                        ToolUseBlock(
+                            type="tool_use",
+                            id=item.call_id,
+                            name=item.name,
+                            input=item.parsed_arguments
+                            if hasattr(item, "parsed_arguments")
+                            else _json_loads_with_repair(item.arguments or "{}"),
                         )
+                    )
+
         if getattr(response, "usage", None):
             u = response.usage
             # ResponseUsage uses input_text_tokens/output_text_tokens

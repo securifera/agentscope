@@ -259,7 +259,7 @@ class AnthropicChatModel(ChatModelBase):
             )
 
         # Extract the system message
-        if messages[0]["role"] == "system":
+        if messages and messages[0]["role"] == "system":
             kwargs["system"] = messages[0]["content"]
             messages = messages[1:]
 

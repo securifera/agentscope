@@ -4,7 +4,7 @@
 import time
 from typing import List, Optional, Set
 
-from .._logging import logger
+from ..._logging import logger
 from ...message import Msg
 from ._config import PruningConfig
 from ._estimator import (
