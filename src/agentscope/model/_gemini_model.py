@@ -404,9 +404,9 @@ class GeminiChatModel(ChatModelBase):
             if text and structured_model:
                 metadata = _json_loads_with_repair(text)
 
-            usage = None
+            # Track the latest usage metadata
             if chunk.usage_metadata:
-                usage = ChatUsage(
+                final_usage = ChatUsage(
                     input_tokens=chunk.usage_metadata.prompt_token_count,
                     output_tokens=chunk.usage_metadata.total_token_count
                     - chunk.usage_metadata.prompt_token_count,
@@ -434,7 +434,7 @@ class GeminiChatModel(ChatModelBase):
 
             yield ChatResponse(
                 content=content_blocks + tool_calls,
-                usage=usage,
+                usage=final_usage,
                 metadata=metadata,
             )
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """The Anthropic token counter class."""
 from typing import Any
+from .._logging import logger
 from ._token_base import TokenCounterBase
 
 
@@ -41,9 +42,18 @@ class AnthropicTokenCounter(TokenCounterBase):
             **kwargs (`Any`):
                 Additional keyword arguments for the token counting API.
         """
+
         system_message = None
-        if messages[0].get("role") == "system":
+        if messages and messages[0].get("role") == "system":
             system_message = messages.pop(0)
+
+        # if system_message:
+        #    logger.error(f"system_message content: {system_message}")
+        if not messages:
+            logger.error(
+                "No user/assistant messages present after removing system message.")
+            raise ValueError(
+                "At least one user or assistant message is required for token counting.")
 
         extra_kwargs: dict = {
             "model": self.model_name,
@@ -55,7 +65,8 @@ class AnthropicTokenCounter(TokenCounterBase):
             extra_kwargs["tools"] = tools
 
         if system_message:
-            extra_kwargs["system"] = system_message
+            extra_kwargs["system"] = system_message.get("content") if isinstance(
+                system_message, dict) else system_message
 
         res = await self.client.messages.count_tokens(**extra_kwargs)
 

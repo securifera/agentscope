@@ -4,8 +4,9 @@
 # mypy: disable-error-code="list-item"
 """ReAct agent class in agentscope."""
 import asyncio
+import time
 from enum import Enum
-from typing import Type, Any, AsyncGenerator, Literal
+from typing import Type, Any, AsyncGenerator, Literal, Optional
 
 from pydantic import BaseModel, ValidationError, Field
 
@@ -14,6 +15,7 @@ from ._react_agent_base import ReActAgentBase
 from .._logging import logger
 from ..formatter import FormatterBase
 from ..memory import MemoryBase, LongTermMemoryBase, InMemoryMemory
+from ..memory._pruning import PruningConfig, ContextPruner
 from ..message import (
     Msg,
     ToolUseBlock,
@@ -197,6 +199,7 @@ class ReActAgent(ReActAgentBase):
         max_iters: int = 10,
         tts_model: TTSModelBase | None = None,
         compression_config: CompressionConfig | None = None,
+        pruning_config: PruningConfig | None = None,
     ) -> None:
         """Initialize the ReAct agent
 
@@ -259,6 +262,10 @@ class ReActAgent(ReActAgentBase):
             compression_config (`CompressionConfig | None`, optional):
                 The compression configuration. If provided, the auto
                 compression will be activated.
+            pruning_config (`PruningConfig | None`, optional):
+                The context pruning configuration. If provided, tool results
+                will be pruned before sending to the model to stay within
+                token limits. This is complementary to compression.
         """
         super().__init__()
 
@@ -276,6 +283,8 @@ class ReActAgent(ReActAgentBase):
         self.formatter = formatter
         self.tts_model = tts_model
         self.compression_config = compression_config
+        self.pruning_config = pruning_config
+        self._last_api_call_time: Optional[float] = None
 
         # -------------- Memory management --------------
         # Record the dialogue history in the memory
@@ -550,16 +559,24 @@ class ReActAgent(ReActAgentBase):
                 await self.print(hint_msg)
             await self.memory.add(hint_msg, marks=_MemoryMark.HINT)
 
+        # Get messages from memory, excluding already-compressed messages
+        # if compression is enabled (compression marks old turns so they
+        # are replaced by a summary and not re-sent to the model)
+        memory_msgs = await self.memory.get_memory(
+            exclude_mark=_MemoryMark.COMPRESSED
+            if self.compression_config and self.compression_config.enable
+            else None,
+        )
+
+        # Apply context pruning if configured (trims large tool result
+        # payloads on a copy without modifying memory)
+        pruned_msgs = await self._prune_context_if_needed(memory_msgs)
+
         # Convert Msg objects into the required format of the model API
         prompt = await self.formatter.format(
             msgs=[
                 Msg("system", self.sys_prompt, "system"),
-                *await self.memory.get_memory(
-                    exclude_mark=_MemoryMark.COMPRESSED
-                    if self.compression_config
-                    and self.compression_config.enable
-                    else None,
-                ),
+                *pruned_msgs,
             ],
         )
         # Clear the hint messages after use
@@ -570,6 +587,9 @@ class ReActAgent(ReActAgentBase):
             tools=self.toolkit.get_json_schemas(),
             tool_choice=tool_choice,
         )
+
+        # Track API call time for cache-ttl pruning mode
+        self._last_api_call_time = time.time()
 
         # handle output from the model
         interrupted_by_user = False
@@ -1131,3 +1151,40 @@ class ReActAgent(ReActAgentBase):
                     "structured output in agent %s.",
                     self.name,
                 )
+
+    async def _prune_context_if_needed(
+        self,
+        messages: list[Msg],
+    ) -> list[Msg]:
+        """Prune context messages if needed based on pruning configuration.
+
+        This implements OpenClaw-style context pruning to reduce tool result
+        sizes before sending to the model. It's complementary to compression.
+
+        Args:
+            messages (`list[Msg]`):
+                The messages to potentially prune.
+
+        Returns:
+            `list[Msg]`:
+                The pruned messages (or original if no pruning needed).
+        """
+        if not self.pruning_config or self.pruning_config.mode == "off":
+            return messages
+
+        # Get model's context window (use 200k tokens as default)
+        model_context_window = getattr(
+            self.model,
+            "max_context_tokens",
+            200_000,
+        )
+
+        # Create pruner and apply pruning
+        pruner = ContextPruner(self.pruning_config)
+        pruned_messages = await pruner.prune_messages(
+            messages,
+            model_context_window=model_context_window,
+            last_api_call_time=self._last_api_call_time,
+        )
+
+        return pruned_messages
