@@ -27,6 +27,7 @@ from ._model_response import ChatResponse
 from ..tracing import trace_llm
 from ..types import JSONSerializableObject
 
+from google.genai import types
 if TYPE_CHECKING:
     from google.genai.types import GenerateContentResponse
 else:
@@ -110,6 +111,34 @@ def _flatten_json_schema(schema: dict) -> dict:
         return result
 
     return _resolve_ref(schema)
+
+
+# Fields that are valid JSON Schema but are not accepted by the Gemini REST API.
+# Both naming conventions are stripped:
+#   - camelCase  (additionalProperties) — what Pydantic/jsonschema emit
+#   - snake_case (additional_properties) — alternate serialisation seen in some SDKs
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    "additionalProperties",
+    "additional_properties",
+    "$schema",
+})
+
+
+def _strip_unsupported_gemini_fields(obj: Any) -> Any:
+    """Recursively remove JSON-Schema fields that the Gemini API rejects.
+
+    Specifically strips ``additionalProperties`` / ``additional_properties``
+    (produced by Pydantic models with ``extra='allow'``) and ``$schema``.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: _strip_unsupported_gemini_fields(v)
+            for k, v in obj.items()
+            if k not in _GEMINI_UNSUPPORTED_SCHEMA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_unsupported_gemini_fields(item) for item in obj]
+    return obj
 
 
 class GeminiChatModel(ChatModelBase):
@@ -249,9 +278,6 @@ class GeminiChatModel(ChatModelBase):
             **self.generate_kwargs,
             **config_kwargs,
         }
-
-        # Prepare tools list with optional Google Search grounding
-        from google.genai import types
 
         tools_to_send: list = []
         if tools:
@@ -622,9 +648,13 @@ class GeminiChatModel(ChatModelBase):
             if "function" not in schema:
                 continue
             func = schema["function"].copy()
-            # Flatten the parameters schema to resolve $ref references
+            # Flatten the parameters schema to resolve $ref references,
+            # then strip fields the Gemini API does not accept
+            # (e.g. additionalProperties / additional_properties from Pydantic).
             if "parameters" in func:
-                func["parameters"] = _flatten_json_schema(func["parameters"])
+                func["parameters"] = _strip_unsupported_gemini_fields(
+                    _flatten_json_schema(func["parameters"])
+                )
             function_declarations.append(func)
 
         return [{"function_declarations": function_declarations}]
