@@ -283,8 +283,10 @@ class GeminiChatModel(ChatModelBase):
         if tools:
             tools_to_send.extend(tools)
 
-        # Add Google Search grounding tool if enabled
-        if self.enable_google_search:
+        # Add Google Search grounding tool if enabled and no custom function
+        # tools are being sent. Gemini rejects requests that mix
+        # function_declarations with the grounding tool.
+        if self.enable_google_search and not tools:
             grounding_tool = types.Tool(
                 google_search=types.GoogleSearch()
             )
@@ -644,7 +646,13 @@ class GeminiChatModel(ChatModelBase):
 
         """
         function_declarations = []
+        native_tools = []
         for schema in schemas:
+            # Native types.Tool objects (e.g. GoogleSearch grounding) are
+            # passed through to the Gemini API unchanged.
+            if isinstance(schema, types.Tool):
+                native_tools.append(schema)
+                continue
             if "function" not in schema:
                 continue
             func = schema["function"].copy()
@@ -657,7 +665,11 @@ class GeminiChatModel(ChatModelBase):
                 )
             function_declarations.append(func)
 
-        return [{"function_declarations": function_declarations}]
+        result = []
+        if function_declarations:
+            result.append({"function_declarations": function_declarations})
+        result.extend(native_tools)
+        return result
 
     def _format_tool_choice(
         self,

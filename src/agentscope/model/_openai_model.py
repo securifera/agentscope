@@ -305,16 +305,16 @@ class OpenAIChatModel(ChatModelBase):
         if "omni" in self.model_name.lower():
             _format_audio_data_for_qwen_omni(messages)
 
-        # Decide whether to use Responses API (only when web_search tool is explicitly requested)
-        has_web_search_tool = (
-            tools and any(
-                (isinstance(t, dict) and t.get("type") == "web_search")
-                for t in tools
-            )
-        )
+        # Decide whether to use Responses API (when web_search is enabled, or
+        # when the caller has explicitly included a web_search tool)
+        # has_web_search_tool = bool(
+        #     tools and any(
+        #         (isinstance(t, dict) and t.get("type") == "web_search")
+        #         for t in tools
+        #     )
+        # )
         use_responses_api = (
             self.enable_web_search
-            and has_web_search_tool
             and not structured_model
             and hasattr(self.client, "responses")
         )
@@ -874,17 +874,56 @@ class OpenAIChatModel(ChatModelBase):
         usage = None
         async with response as stream:
             async for event in stream:
-                # logger.debug("Responses stream event: %s", str(event))
                 et = getattr(event, "type", None)
                 if et == "response.error":
                     logger.error("Responses stream error: %s",
                                  getattr(event, "error", None))
                     continue
+
+                if et == "response.output_text.delta":
+                    text += event.delta
+                    # Accumulate only — do NOT yield per-delta.  Emitting a
+                    # ChatResponse(TextBlock) on every delta causes the ReAct
+                    # agent to treat the first partial chunk as a completed
+                    # turn and return before the full response arrives.
+                    continue
+
+                if et == "response.output_audio.delta":
+                    audio += event.delta
+                    continue
+
+                if et == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "function_call":
+                        tool_calls[item.id] = {
+                            "type": "tool_use",
+                            "id": item.call_id,
+                            "name": item.name,
+                            "input": "",
+                        }
+                    continue
+
+                if et == "response.function_call_arguments.delta":
+                    tc = tool_calls.get(event.item_id)
+                    if tc:
+                        tc["input"] += event.delta
+                    continue
+
+                if et == "response.function_call_arguments.done":
+                    # Arguments are complete — update the stored input to the
+                    # final parsed form. The tool call is emitted once in the
+                    # consolidated response.completed block below (not here) to
+                    # avoid the ReAct agent seeing duplicate ToolUseBlocks.
+                    tc = tool_calls.get(event.item_id)
+                    if tc:
+                        tc["input"] = _json_loads_with_repair(
+                            tc["input"] or "{}")
+                    continue
+
                 if et == "response.completed":
                     resp = getattr(event, "response", None)
                     if resp and getattr(resp, "usage", None):
                         u = resp.usage
-                        # ResponseUsage uses input_text_tokens/output_text_tokens
                         input_tokens = (
                             getattr(u, "input_text_tokens", None)
                             or getattr(u, "prompt_tokens", None)
@@ -901,44 +940,8 @@ class OpenAIChatModel(ChatModelBase):
                             time=(datetime.now() -
                                   start_datetime).total_seconds(),
                         )
-                if et == "response.output_text.delta":
-                    text += event.delta
-                if et == "response.output_audio.delta":
-                    audio += event.delta
-                if et == "response.output_item.added":
-                    item = getattr(event, "item", None)
-                    if getattr(item, "type", None) == "function_call":
-                        tool_calls[item.id] = {
-                            "type": "tool_use",
-                            "id": item.call_id,
-                            "name": item.name,
-                            "input": "",
-                        }
-
-                if et == "response.function_call_arguments.delta":
-                    tc = tool_calls.get(event.item_id)
-                    if tc:
-                        tc["input"] += event.delta
-
-                # if et == "response.output_tool_calls.delta":
-                #     for tc in event.delta:
-                #         idx = tc.get("index")
-                #         fn = tc.get("function", {})
-                #         args = fn.get("arguments")
-                #         if idx not in tool_calls:
-                #             tool_calls[idx] = {
-                #                 "type": "tool_use",
-                #                 "id": tc.get("id"),
-                #                 "name": fn.get("name"),
-                #                 "input": args if isinstance(args, dict) else "",
-                #             }
-                #         else:
-                #             if isinstance(args, str):
-                #                 tool_calls[idx]["input"] += args
-                #             elif isinstance(args, dict):
-                #                 tool_calls[idx]["input"] = args
-
-                if et and et.startswith("response."):
+                    # Emit a final consolidated response so the agent can
+                    # finalize its state with accurate usage info.
                     contents: list[Any] = []
                     if audio:
                         contents.append(
@@ -966,9 +969,8 @@ class OpenAIChatModel(ChatModelBase):
                                 ),
                             ),
                         )
-                    if not contents:
-                        continue
-                    yield ChatResponse(content=contents, usage=usage)
+                    if contents:
+                        yield ChatResponse(content=contents, usage=usage)
 
     def _parse_openai_responses_response(
         self,
